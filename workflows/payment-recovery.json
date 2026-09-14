@@ -1,0 +1,189 @@
+{
+  "name": "Payment Recovery Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "events": [
+          "charge.failed",
+          "customer.subscription.deleted"
+        ]
+      },
+      "id": "101",
+      "name": "Stripe Webhook Trigger",
+      "type": "n8n-nodes-base.stripeTrigger",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "customer",
+        "operation": "get",
+        "customerId": "={{ $json.body.data.object.customer }}"
+      },
+      "id": "102",
+      "name": "Customer Lookup",
+      "type": "n8n-nodes-base.stripe",
+      "typeVersion": 1,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "hours"
+      },
+      "id": "103",
+      "name": "Wait Delay 2 Hours",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4o",
+        "prompt": "Generate a friendly, high-converting payment recovery email and SMS for customer {{ $json.name }} whose payment of ${{ $json.amount / 100 }} failed for reason: {{ $json.failure_reason }}."
+      },
+      "id": "104",
+      "name": "AI Personal Dunning Copy",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [
+        920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendSms",
+        "message": "={{ $node['AI Personal Dunning Copy'].json.text }}",
+        "to": "={{ $node['Customer Lookup'].json.phone }}"
+      },
+      "id": "105",
+      "name": "Send Twilio SMS / Email",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        1140,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "channel": "#billing-alerts",
+        "text": ":warning: *Payment Failed*: Customer {{ $node['Customer Lookup'].json.email }} (${{ $node['Customer Lookup'].json.account_balance / 100 }}). Dunning sequence dispatched."
+      },
+      "id": "106",
+      "name": "Notify Billing Slack Channel",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [
+        1140,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "update",
+        "email": "={{ $node['Customer Lookup'].json.email }}",
+        "properties": {
+          "payment_status": "past_due_dunning_active"
+        }
+      },
+      "id": "107",
+      "name": "Update HubSpot Status",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Stripe Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Customer Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Customer Lookup": {
+      "main": [
+        [
+          {
+            "node": "Wait Delay 2 Hours",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Delay 2 Hours": {
+      "main": [
+        [
+          {
+            "node": "AI Personal Dunning Copy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Personal Dunning Copy": {
+      "main": [
+        [
+          {
+            "node": "Send Twilio SMS / Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Billing Slack Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Twilio SMS / Email": {
+      "main": [
+        [
+          {
+            "node": "Update HubSpot Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Billing Slack Channel": {
+      "main": [
+        [
+          {
+            "node": "Update HubSpot Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
