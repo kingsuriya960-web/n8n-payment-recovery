@@ -1,189 +1,521 @@
 {
-  "name": "Payment Recovery Automation",
+  "name": "Payment Recovery Cascade (Multi-Day)",
   "nodes": [
     {
-      "parameters": {
-        "events": [
-          "charge.failed",
-          "customer.subscription.deleted"
-        ]
-      },
-      "id": "101",
+      "id": "1",
       "name": "Stripe Webhook Trigger",
       "type": "n8n-nodes-base.stripeTrigger",
       "typeVersion": 1,
-      "position": [
-        250,
-        300
-      ]
+      "position": [200, 500],
+      "parameters": {
+        "events": ["invoice.payment_failed"]
+      },
+      "notes": "invoice.payment_failed is Stripe's recommended event for dunning (not charge.failed) — it carries attempt_count and hosted_invoice_url directly."
     },
     {
+      "id": "2",
+      "name": "Extract Event Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [420, 500],
       "parameters": {
-        "resource": "customer",
+        "values": {
+          "string": [
+            { "name": "invoiceId", "value": "={{$json.body.data.object.id}}" },
+            { "name": "customerId", "value": "={{$json.body.data.object.customer}}" },
+            { "name": "subscriptionId", "value": "={{$json.body.data.object.subscription}}" },
+            { "name": "chargeId", "value": "={{$json.body.data.object.charge}}" },
+            { "name": "currency", "value": "={{$json.body.data.object.currency}}" },
+            { "name": "hostedInvoiceUrl", "value": "={{$json.body.data.object.hosted_invoice_url}}" }
+          ],
+          "number": [
+            { "name": "amountDue", "value": "={{$json.body.data.object.amount_due}}" },
+            { "name": "attemptCount", "value": "={{$json.body.data.object.attempt_count}}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3",
+      "name": "Get Charge Details",
+      "type": "n8n-nodes-base.stripe",
+      "typeVersion": 1,
+      "position": [640, 500],
+      "parameters": {
+        "resource": "charge",
         "operation": "get",
-        "customerId": "={{ $json.body.data.object.customer }}"
+        "chargeId": "={{$json.chargeId}}"
       },
-      "id": "102",
+      "notes": "Fetches the actual decline reason (card_declined, insufficient_funds, expired_card, etc.) — this isn't in the invoice.payment_failed payload itself."
+    },
+    {
+      "id": "4",
+      "name": "Merge Failure Info",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [860, 500],
+      "parameters": {
+        "values": {
+          "string": [
+            { "name": "failureCode", "value": "={{$json.failure_code || 'unknown'}}" },
+            { "name": "failureMessage", "value": "={{$json.failure_message || 'Payment could not be processed'}}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5",
+      "name": "Idempotency Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 500],
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst item = $input.first().json;\nconst key = `${item.invoiceId}_${item.attemptCount}`;\n\nif (!staticData.processedEvents) {\n  staticData.processedEvents = {};\n}\n\nconst isDuplicate = !!staticData.processedEvents[key];\n\nif (!isDuplicate) {\n  staticData.processedEvents[key] = Date.now();\n}\n\nreturn [{ json: { ...item, isDuplicate } }];"
+      },
+      "notes": "Stripe frequently redelivers webhooks. This blocks sending the same customer the same notification twice for the same invoice/attempt combination."
+    },
+    {
+      "id": "6",
+      "name": "IF Duplicate Event",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1300, 500],
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{$json.isDuplicate}}", "value2": true }]
+        }
+      }
+    },
+    {
+      "id": "7",
+      "name": "Skip - Duplicate Event",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1520, 400],
+      "parameters": {}
+    },
+    {
+      "id": "8",
       "name": "Customer Lookup",
       "type": "n8n-nodes-base.stripe",
       "typeVersion": 1,
-      "position": [
-        480,
-        300
-      ]
-    },
-    {
+      "position": [1520, 600],
       "parameters": {
-        "amount": 2,
-        "unit": "hours"
-      },
-      "id": "103",
-      "name": "Wait Delay 2 Hours",
-      "type": "n8n-nodes-base.wait",
-      "typeVersion": 1,
-      "position": [
-        700,
-        300
-      ]
+        "resource": "customer",
+        "operation": "get",
+        "customerId": "={{$json.customerId}}"
+      }
     },
     {
+      "id": "9",
+      "name": "Check Invoice Status - Attempt 1",
+      "type": "n8n-nodes-base.stripe",
+      "typeVersion": 1,
+      "position": [1740, 600],
+      "parameters": {
+        "resource": "invoice",
+        "operation": "get",
+        "invoiceId": "={{$('Extract Event Data').item.json.invoiceId}}"
+      },
+      "notes": "Re-checks BEFORE messaging — customer may have already fixed their card since the webhook fired."
+    },
+    {
+      "id": "10",
+      "name": "IF Paid - Attempt 1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1960, 600],
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.status}}", "value2": "paid" }]
+        }
+      }
+    },
+    {
+      "id": "11",
+      "name": "Mark Resolved - Attempt 1",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 1,
+      "position": [2180, 500],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{$('Customer Lookup').item.json.email}}",
+        "additionalFields": { "payment_status": "resolved" }
+      }
+    },
+    {
+      "id": "12",
+      "name": "Generate Recovery Copy - Attempt 1",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [2180, 700],
       "parameters": {
         "resource": "chat",
         "model": "gpt-4o",
-        "prompt": "Generate a friendly, high-converting payment recovery email and SMS for customer {{ $json.name }} whose payment of ${{ $json.amount / 100 }} failed for reason: {{ $json.failure_reason }}."
-      },
-      "id": "104",
-      "name": "AI Personal Dunning Copy",
-      "type": "n8n-nodes-base.openAi",
-      "typeVersion": 1,
-      "position": [
-        920,
-        300
-      ]
+        "prompt": "=Write a short, friendly SMS (under 300 characters) for {{$('Customer Lookup').item.json.name}} whose payment of {{$('Extract Event Data').item.json.amountDue / 100}} {{$('Extract Event Data').item.json.currency}} failed. Reason code: {{$('Merge Failure Info').item.json.failureCode}}. If the reason is 'expired_card', ask them to update their card. If 'insufficient_funds', suggest retrying in a couple of days. Otherwise, ask them to check their payment method. This is attempt 1 of 3 — keep the tone light, not urgent. Include this exact link at the end: {{$('Extract Event Data').item.json.hostedInvoiceUrl}}"
+      }
     },
     {
-      "parameters": {
-        "operation": "sendSms",
-        "message": "={{ $node['AI Personal Dunning Copy'].json.text }}",
-        "to": "={{ $node['Customer Lookup'].json.phone }}"
-      },
-      "id": "105",
-      "name": "Send Twilio SMS / Email",
+      "id": "13",
+      "name": "Send SMS - Attempt 1",
       "type": "n8n-nodes-base.twilio",
       "typeVersion": 1,
-      "position": [
-        1140,
-        200
-      ]
+      "position": [2400, 700],
+      "parameters": {
+        "operation": "sendSms",
+        "message": "={{$json.text}}",
+        "to": "={{$('Customer Lookup').item.json.phone}}"
+      }
     },
     {
-      "parameters": {
-        "channel": "#billing-alerts",
-        "text": ":warning: *Payment Failed*: Customer {{ $node['Customer Lookup'].json.email }} (${{ $node['Customer Lookup'].json.account_balance / 100 }}). Dunning sequence dispatched."
-      },
-      "id": "106",
-      "name": "Notify Billing Slack Channel",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 1,
-      "position": [
-        1140,
-        420
-      ]
-    },
-    {
-      "parameters": {
-        "resource": "contact",
-        "operation": "update",
-        "email": "={{ $node['Customer Lookup'].json.email }}",
-        "properties": {
-          "payment_status": "past_due_dunning_active"
-        }
-      },
-      "id": "107",
-      "name": "Update HubSpot Status",
+      "id": "14",
+      "name": "Update CRM - Attempt 1",
       "type": "n8n-nodes-base.hubspot",
       "typeVersion": 1,
-      "position": [
-        1360,
-        300
-      ]
+      "position": [2620, 700],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{$('Customer Lookup').item.json.email}}",
+        "additionalFields": { "payment_status": "past_due_dunning_attempt_1" }
+      }
+    },
+    {
+      "id": "15",
+      "name": "Wait 24 Hours",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [2840, 700],
+      "parameters": { "unit": "hours", "amount": 24 }
+    },
+    {
+      "id": "16",
+      "name": "Check Invoice Status - Attempt 2",
+      "type": "n8n-nodes-base.stripe",
+      "typeVersion": 1,
+      "position": [3060, 700],
+      "parameters": {
+        "resource": "invoice",
+        "operation": "get",
+        "invoiceId": "={{$('Extract Event Data').item.json.invoiceId}}"
+      }
+    },
+    {
+      "id": "17",
+      "name": "IF Paid - Attempt 2",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [3280, 700],
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.status}}", "value2": "paid" }]
+        }
+      }
+    },
+    {
+      "id": "18",
+      "name": "Mark Resolved - Attempt 2",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 1,
+      "position": [3500, 600],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{$('Customer Lookup').item.json.email}}",
+        "additionalFields": { "payment_status": "resolved" }
+      }
+    },
+    {
+      "id": "19",
+      "name": "Generate Recovery Copy - Attempt 2",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [3500, 800],
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4o",
+        "prompt": "=Write a more urgent SMS (under 300 characters) for {{$('Customer Lookup').item.json.name}} — this is the 2nd reminder that their payment of {{$('Extract Event Data').item.json.amountDue / 100}} {{$('Extract Event Data').item.json.currency}} is still failing (reason: {{$('Merge Failure Info').item.json.failureCode}}). Mention their service may be interrupted soon if unresolved. Include this exact link: {{$('Extract Event Data').item.json.hostedInvoiceUrl}}"
+      }
+    },
+    {
+      "id": "20",
+      "name": "Send SMS - Attempt 2",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [3720, 750],
+      "parameters": {
+        "operation": "sendSms",
+        "message": "={{$json.text}}",
+        "to": "={{$('Customer Lookup').item.json.phone}}"
+      }
+    },
+    {
+      "id": "21",
+      "name": "Notify Billing Slack - Attempt 2",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [3720, 850],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#billing-alerts",
+        "text": "=:warning: 2nd failed payment attempt for {{$('Customer Lookup').item.json.email}} (${{$('Extract Event Data').item.json.amountDue / 100}}). Reason: {{$('Merge Failure Info').item.json.failureCode}}."
+      },
+      "notes": "Slack alerts only start at attempt 2+ — every single failure pinging the team is noise, not signal."
+    },
+    {
+      "id": "22",
+      "name": "Update CRM - Attempt 2",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 1,
+      "position": [3940, 800],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{$('Customer Lookup').item.json.email}}",
+        "additionalFields": { "payment_status": "past_due_dunning_attempt_2" }
+      },
+      "notes": "Both Send SMS and Notify Slack connect INTO this single node — avoids the duplicate-write bug from the original workflow."
+    },
+    {
+      "id": "23",
+      "name": "Wait 3 Days",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [4160, 800],
+      "parameters": { "unit": "days", "amount": 3 }
+    },
+    {
+      "id": "24",
+      "name": "Check Invoice Status - Attempt 3",
+      "type": "n8n-nodes-base.stripe",
+      "typeVersion": 1,
+      "position": [4380, 800],
+      "parameters": {
+        "resource": "invoice",
+        "operation": "get",
+        "invoiceId": "={{$('Extract Event Data').item.json.invoiceId}}"
+      }
+    },
+    {
+      "id": "25",
+      "name": "IF Paid - Attempt 3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [4600, 800],
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.status}}", "value2": "paid" }]
+        }
+      }
+    },
+    {
+      "id": "26",
+      "name": "Mark Resolved - Attempt 3",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 1,
+      "position": [4820, 700],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{$('Customer Lookup').item.json.email}}",
+        "additionalFields": { "payment_status": "resolved" }
+      }
+    },
+    {
+      "id": "27",
+      "name": "Generate Final Notice Copy",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [4820, 900],
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4o",
+        "prompt": "=Write a final-notice SMS (under 300 characters) for {{$('Customer Lookup').item.json.name}}. This is the LAST reminder — if payment of {{$('Extract Event Data').item.json.amountDue / 100}} {{$('Extract Event Data').item.json.currency}} isn't received within 4 days, their subscription will be cancelled. Be clear and direct but not aggressive. Include this exact link: {{$('Extract Event Data').item.json.hostedInvoiceUrl}}"
+      }
+    },
+    {
+      "id": "28",
+      "name": "Send SMS - Final Notice",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [5040, 850],
+      "parameters": {
+        "operation": "sendSms",
+        "message": "={{$json.text}}",
+        "to": "={{$('Customer Lookup').item.json.phone}}"
+      }
+    },
+    {
+      "id": "29",
+      "name": "Notify Billing Slack - Final Notice",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [5040, 950],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#billing-alerts",
+        "text": "=:rotating_light: FINAL notice sent to {{$('Customer Lookup').item.json.email}}. Subscription cancels in 4 days if unpaid."
+      }
+    },
+    {
+      "id": "30",
+      "name": "Update CRM - Final Notice",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 1,
+      "position": [5260, 900],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{$('Customer Lookup').item.json.email}}",
+        "additionalFields": { "payment_status": "past_due_final_notice" }
+      }
+    },
+    {
+      "id": "31",
+      "name": "Wait 4 Days",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [5480, 900],
+      "parameters": { "unit": "days", "amount": 4 }
+    },
+    {
+      "id": "32",
+      "name": "Check Invoice Status - Final Check",
+      "type": "n8n-nodes-base.stripe",
+      "typeVersion": 1,
+      "position": [5700, 900],
+      "parameters": {
+        "resource": "invoice",
+        "operation": "get",
+        "invoiceId": "={{$('Extract Event Data').item.json.invoiceId}}"
+      }
+    },
+    {
+      "id": "33",
+      "name": "IF Paid - Final Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [5920, 900],
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{$json.status}}", "value2": "paid" }]
+        }
+      }
+    },
+    {
+      "id": "34",
+      "name": "Mark Resolved - Final Check",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 1,
+      "position": [6140, 800],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{$('Customer Lookup').item.json.email}}",
+        "additionalFields": { "payment_status": "resolved" }
+      }
+    },
+    {
+      "id": "35",
+      "name": "Cancel Subscription",
+      "type": "n8n-nodes-base.stripe",
+      "typeVersion": 1,
+      "position": [6140, 1000],
+      "parameters": {
+        "resource": "subscription",
+        "operation": "cancel",
+        "subscriptionId": "={{$('Extract Event Data').item.json.subscriptionId}}"
+      },
+      "notes": "This is the stopping condition the original workflow was missing — after 4 touches over ~8 days, the cascade ends by acting, not by silently doing nothing."
+    },
+    {
+      "id": "36",
+      "name": "Notify Sales - Escalation",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 1,
+      "position": [6360, 1000],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#sales-churn-risk",
+        "text": "=Customer {{$('Customer Lookup').item.json.email}} cancelled due to unresolved failed payment after full dunning cascade. Consider a win-back outreach."
+      }
+    },
+    {
+      "id": "37",
+      "name": "Update CRM - Churned",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 1,
+      "position": [6580, 1000],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{$('Customer Lookup').item.json.email}}",
+        "additionalFields": { "payment_status": "churned_payment_failure" }
+      }
     }
   ],
   "connections": {
-    "Stripe Webhook Trigger": {
+    "Stripe Webhook Trigger": { "main": [[{ "node": "Extract Event Data", "type": "main", "index": 0 }]] },
+    "Extract Event Data": { "main": [[{ "node": "Get Charge Details", "type": "main", "index": 0 }]] },
+    "Get Charge Details": { "main": [[{ "node": "Merge Failure Info", "type": "main", "index": 0 }]] },
+    "Merge Failure Info": { "main": [[{ "node": "Idempotency Guard", "type": "main", "index": 0 }]] },
+    "Idempotency Guard": { "main": [[{ "node": "IF Duplicate Event", "type": "main", "index": 0 }]] },
+    "IF Duplicate Event": {
       "main": [
-        [
-          {
-            "node": "Customer Lookup",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{ "node": "Skip - Duplicate Event", "type": "main", "index": 0 }],
+        [{ "node": "Customer Lookup", "type": "main", "index": 0 }]
       ]
     },
-    "Customer Lookup": {
+    "Customer Lookup": { "main": [[{ "node": "Check Invoice Status - Attempt 1", "type": "main", "index": 0 }]] },
+    "Check Invoice Status - Attempt 1": { "main": [[{ "node": "IF Paid - Attempt 1", "type": "main", "index": 0 }]] },
+    "IF Paid - Attempt 1": {
       "main": [
-        [
-          {
-            "node": "Wait Delay 2 Hours",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{ "node": "Mark Resolved - Attempt 1", "type": "main", "index": 0 }],
+        [{ "node": "Generate Recovery Copy - Attempt 1", "type": "main", "index": 0 }]
       ]
     },
-    "Wait Delay 2 Hours": {
+    "Generate Recovery Copy - Attempt 1": { "main": [[{ "node": "Send SMS - Attempt 1", "type": "main", "index": 0 }]] },
+    "Send SMS - Attempt 1": { "main": [[{ "node": "Update CRM - Attempt 1", "type": "main", "index": 0 }]] },
+    "Update CRM - Attempt 1": { "main": [[{ "node": "Wait 24 Hours", "type": "main", "index": 0 }]] },
+    "Wait 24 Hours": { "main": [[{ "node": "Check Invoice Status - Attempt 2", "type": "main", "index": 0 }]] },
+    "Check Invoice Status - Attempt 2": { "main": [[{ "node": "IF Paid - Attempt 2", "type": "main", "index": 0 }]] },
+    "IF Paid - Attempt 2": {
       "main": [
-        [
-          {
-            "node": "AI Personal Dunning Copy",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{ "node": "Mark Resolved - Attempt 2", "type": "main", "index": 0 }],
+        [{ "node": "Generate Recovery Copy - Attempt 2", "type": "main", "index": 0 }]
       ]
     },
-    "AI Personal Dunning Copy": {
+    "Generate Recovery Copy - Attempt 2": {
+      "main": [[{ "node": "Send SMS - Attempt 2", "type": "main", "index": 0 }, { "node": "Notify Billing Slack - Attempt 2", "type": "main", "index": 0 }]]
+    },
+    "Send SMS - Attempt 2": { "main": [[{ "node": "Update CRM - Attempt 2", "type": "main", "index": 0 }]] },
+    "Notify Billing Slack - Attempt 2": { "main": [[{ "node": "Update CRM - Attempt 2", "type": "main", "index": 0 }]] },
+    "Update CRM - Attempt 2": { "main": [[{ "node": "Wait 3 Days", "type": "main", "index": 0 }]] },
+    "Wait 3 Days": { "main": [[{ "node": "Check Invoice Status - Attempt 3", "type": "main", "index": 0 }]] },
+    "Check Invoice Status - Attempt 3": { "main": [[{ "node": "IF Paid - Attempt 3", "type": "main", "index": 0 }]] },
+    "IF Paid - Attempt 3": {
       "main": [
-        [
-          {
-            "node": "Send Twilio SMS / Email",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Notify Billing Slack Channel",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{ "node": "Mark Resolved - Attempt 3", "type": "main", "index": 0 }],
+        [{ "node": "Generate Final Notice Copy", "type": "main", "index": 0 }]
       ]
     },
-    "Send Twilio SMS / Email": {
+    "Generate Final Notice Copy": {
+      "main": [[{ "node": "Send SMS - Final Notice", "type": "main", "index": 0 }, { "node": "Notify Billing Slack - Final Notice", "type": "main", "index": 0 }]]
+    },
+    "Send SMS - Final Notice": { "main": [[{ "node": "Update CRM - Final Notice", "type": "main", "index": 0 }]] },
+    "Notify Billing Slack - Final Notice": { "main": [[{ "node": "Update CRM - Final Notice", "type": "main", "index": 0 }]] },
+    "Update CRM - Final Notice": { "main": [[{ "node": "Wait 4 Days", "type": "main", "index": 0 }]] },
+    "Wait 4 Days": { "main": [[{ "node": "Check Invoice Status - Final Check", "type": "main", "index": 0 }]] },
+    "Check Invoice Status - Final Check": { "main": [[{ "node": "IF Paid - Final Check", "type": "main", "index": 0 }]] },
+    "IF Paid - Final Check": {
       "main": [
-        [
-          {
-            "node": "Update HubSpot Status",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        [{ "node": "Mark Resolved - Final Check", "type": "main", "index": 0 }],
+        [{ "node": "Cancel Subscription", "type": "main", "index": 0 }]
       ]
     },
-    "Notify Billing Slack Channel": {
-      "main": [
-        [
-          {
-            "node": "Update HubSpot Status",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    }
-  },
-  "active": true,
-  "settings": {
-    "executionOrder": "v1"
-  }
-}
+    "Cancel Subscription": { "main": [[{ "node": "Notify Sales - Escalation", "type": "main", "index": 0 }]] },
+    "Notify Sales - Escalation": { "main": [[{ "node": "Update
